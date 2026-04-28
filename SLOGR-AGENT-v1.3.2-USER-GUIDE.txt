@@ -1,0 +1,1405 @@
+================================================================================
+  SLOGR AGENT v1.3.2 — COMPLETE USER GUIDE
+  Customer trial + enterprise evaluation
+  Released: 2026-04-23    Commits: f7487d9, c5df63f
+================================================================================
+
+WHAT IS THIS?
+-------------
+Slogr Agent is a network measurement agent that runs on cloud VMs, bare-metal
+servers, or containers and measures network quality between endpoints using
+TWAMP (Two-Way Active Measurement Protocol, RFC 5357). For each session it
+reports ground-truth RTT, directional RTT split, jitter, packet loss, traceroute
+with ASN enrichment, and an SLA grade (GREEN/YELLOW/RED) evaluated against 24
+application profiles (VoIP, gaming, streaming, PCoIP, video conferencing, etc.).
+
+v1.3.2 is the current production release of the Kotlin/JVM agent. It adds
+RFC-1014 (Enterprise RabbitMQ command channel) and RFC-1015 (mesh-ready runtime
+with health endpoint, cloud-metadata fingerprint, bounded JWT recovery) on top
+of the R2 baseline. SaaS defaults are byte-identical to v1.2.4 — existing
+SaaS deployments can upgrade to v1.3.2 without configuration changes.
+
+
+WHERE TO GET IT
+---------------
+Repository:      https://github.com/slogr-io/slogr-agent-kotlin
+Branch:          master (v1.3.2 tagged on master)
+Docker image:    ghcr.io/slogr-io/agent:1.3.2
+                 ghcr.io/slogr-io/agent:latest
+GAR index digest (pin for terraform MIG):
+                 sha256:268c81914af7142df09e68a9034c996c5a1a37e36e55b3025cd5795fdbbf96f3
+
+Artifacts built from master:
+  - Shadow JAR:     app/build/libs/slogr-agent-all.jar
+  - Docker image:   built via:  docker build -f Dockerfile -t slogr-agent:1.3.2 .
+  - Native library: native/libs/libslogr-native.so       (Linux glibc)
+                    native/libs/libslogr-native-musl.so  (Linux musl/Alpine,
+                                                          dev builds only)
+
+Base image: eclipse-temurin:21-jre-jammy (glibc Ubuntu 22.04). The Alpine/musl
+base used in earlier releases was retired in v1.2.4 because Netty tcnative's
+bundled glibc .so crashed under musl. Do NOT rebuild on Alpine.
+
+
+================================================================================
+  AGENT STATES
+================================================================================
+
+The agent operates in one of three modes determined by SLOGR_API_KEY:
+
+  ANONYMOUS   No API key set, or invalid prefix.
+              - stdout logging only
+              - No OTLP export, no RabbitMQ, no Pub/Sub
+              - Useful for smoke-testing the TWAMP reflector without a cloud
+                account. `check` and reflector still work.
+
+  REGISTERED  API key starts with sk_free_
+              - OTLP metrics export enabled (if SLOGR_OTLP_ENDPOINT set)
+              - stdout logging
+              - No RabbitMQ, no Pub/Sub
+              - Free-tier cloud telemetry (aggregated only)
+
+  CONNECTED   API key starts with sk_live_
+              - Full cloud integration: OTLP + RabbitMQ + command channel
+              - Auto-registers with api.slogr.io on first daemon start
+              - Receives measurement schedules from backend
+              - Reports results back to the Slogr cloud (or on-prem Enterprise
+                controller when SLOGR_COMMAND_CHANNEL=rabbitmq)
+
+State is derived at process start from the SLOGR_API_KEY prefix. The agent
+never "promotes" itself at runtime — restart the process after changing the key.
+
+
+================================================================================
+  INSTALLATION
+================================================================================
+
+---  OPTION 1: DOCKER (Recommended)  ---
+
+Requirements:
+  - Docker 20.10+
+  - Linux host (for raw sockets / port 862 bind)
+
+Install Docker on a fresh Linux VM (Debian 12 / Ubuntu 22.04):
+  sudo apt-get update
+  sudo apt-get install -y docker.io
+  sudo systemctl enable --now docker
+
+Pull:
+  sudo docker pull ghcr.io/slogr-io/agent:1.3.2
+
+Note on pull time:
+  The v1.3.2 image is ~200 MB. On burstable micro instances (e2-micro,
+  Standard_B1s, t4g.micro) the first pull takes 60-90 seconds because the
+  CPU is throttled and network is shared. After `docker run`, allow a
+  further ~10 seconds for the JVM to start and the reflector to bind
+  port 862 before issuing a `check` against this host.
+
+Run (ANONYMOUS — reflector-only smoke test):
+  sudo docker run -d \
+    --name slogr-agent \
+    --restart unless-stopped \
+    --network host \
+    ghcr.io/slogr-io/agent:1.3.2 daemon
+
+Run (REGISTERED — sk_free_ key for OTLP):
+  sudo docker run -d \
+    --name slogr-agent \
+    --restart unless-stopped \
+    --network host \
+    -e SLOGR_API_KEY=sk_free_XXXXXXXXXX \
+    -e SLOGR_OTLP_ENDPOINT=https://otel.slogr.io/v1/metrics \
+    -v /opt/slogr/data:/opt/slogr/data \
+    ghcr.io/slogr-io/agent:1.3.2 daemon
+
+Run (CONNECTED — sk_live_ key, SaaS):
+  sudo docker run -d \
+    --name slogr-agent \
+    --restart unless-stopped \
+    --network host \
+    -e SLOGR_API_KEY=sk_live_XXXXXXXXXX \
+    -e SLOGR_OTLP_ENDPOINT=https://otel.slogr.io/v1/metrics \
+    -v /opt/slogr/data:/opt/slogr/data \
+    ghcr.io/slogr-io/agent:1.3.2 daemon
+
+Run (CONNECTED — sk_live_ key, Enterprise on-prem RabbitMQ command channel):
+  sudo docker run -d \
+    --name slogr-agent \
+    --restart unless-stopped \
+    --network host \
+    -e SLOGR_API_KEY=sk_live_XXXXXXXXXX \
+    -e SLOGR_API_URL=https://slogr.acme.corp \
+    -e SLOGR_COMMAND_CHANNEL=rabbitmq \
+    -v /opt/slogr/data:/opt/slogr/data \
+    ghcr.io/slogr-io/agent:1.3.2 daemon
+
+Notes:
+  - `--network host` is required. TWAMP negotiates UDP ports dynamically which
+    do not traverse Docker's NAT cleanly.
+  - `--restart unless-stopped` makes the container survive host reboots and
+    docker daemon restarts — recommended for any cloud-VM deployment.
+  - Port 862 binding works out-of-the-box because the image applies
+    `setcap cap_net_bind_service,cap_net_raw +ep` directly on the `java`
+    binary during build (see Dockerfile). With `--network host` the java
+    process inherits those file capabilities and can bind port 862 without
+    being root. NO --sysctl, NO --cap-add required.
+  - DO NOT add `--sysctl net.ipv4.ip_unprivileged_port_start=862` when using
+    `--network host` — Docker rejects the combination because the sysctl
+    would apply to the host kernel, not just the container:
+      runc create failed: sysctl "net.ipv4.ip_unprivileged_port_start"
+      not allowed in host network namespace
+    The sysctl approach is only valid for bridge-networked containers, which
+    the agent does not use.
+  - Fallback for images built without `setcap` (custom builds or stripped
+    security profiles): use `--cap-add NET_BIND_SERVICE --cap-add NET_RAW`
+    alongside `--network host`. Not needed for ghcr.io/slogr-io/agent:1.3.2.
+  - On GCP Container-Optimized OS (COS), also add host-level iptables rules
+    allowing inbound TCP 862 + UDP 862-863 — see AGENT-002 in the open-issues
+    tracker. Restart the guest agent after firewall changes:
+        sudo systemctl restart google-guest-agent
+
+View logs:   sudo docker logs -f slogr-agent
+Stop:        sudo docker stop slogr-agent
+
+
+---  OPTION 2: SYSTEMD (Linux VMs / bare metal)  ---
+
+Requirements:
+  - Java 21 (Amazon Corretto 21 or Temurin 21)
+  - libslogr-native.so placed in /opt/slogr/lib/
+
+1. Create user and directories:
+     sudo useradd -r -s /sbin/nologin -d /opt/slogr -u 10001 slogr
+     sudo mkdir -p /opt/slogr/lib /opt/slogr/data /opt/slogr/logs /etc/slogr
+     sudo chown -R slogr:slogr /opt/slogr
+     sudo touch /etc/slogr/env && sudo chmod 600 /etc/slogr/env
+
+2. Copy files:
+     sudo cp slogr-agent-all.jar         /opt/slogr/
+     sudo cp libslogr-native.so          /opt/slogr/lib/
+     sudo cp deploy/wrapper.sh           /usr/local/bin/slogr-agent
+     sudo cp deploy/slogr-agent.service  /etc/systemd/system/
+     sudo chmod +x /usr/local/bin/slogr-agent
+
+3. Set API key (optional — only for REGISTERED or CONNECTED):
+     echo 'SLOGR_API_KEY=sk_live_XXXXXXXXXX' | sudo tee -a /etc/slogr/env
+     echo 'SLOGR_OTLP_ENDPOINT=https://otel.slogr.io/v1/metrics' | sudo tee -a /etc/slogr/env
+
+4. Grant raw-socket + low-port capability on the java binary (alternative to
+   ambient capabilities in the service file):
+     sudo setcap 'cap_net_bind_service=+ep cap_net_raw=+ep' $(readlink -f $(which java))
+
+5. Enable and start:
+     sudo systemctl daemon-reload
+     sudo systemctl enable slogr-agent
+     sudo systemctl start slogr-agent
+
+6. Verify:
+     sudo systemctl status slogr-agent
+     sudo journalctl -u slogr-agent -f
+
+
+---  OPTION 3: RPM PACKAGE  ---
+
+Build:
+  rpmbuild -ba packaging/rpm/slogr-agent.spec
+
+Install:
+  sudo rpm -i slogr-agent-1.3.2-1.el9.x86_64.rpm
+  echo 'SLOGR_API_KEY=sk_live_XXXXXXXXXX' | sudo tee -a /etc/slogr/env
+  sudo systemctl start slogr-agent
+
+
+---  OPTION 4: DEB PACKAGE  ---
+
+Build:
+  dpkg-deb --build packaging/deb slogr-agent_1.3.2_amd64.deb
+
+Install:
+  sudo dpkg -i slogr-agent_1.3.2_amd64.deb
+  sudo apt-get install -f
+  echo 'SLOGR_API_KEY=sk_live_XXXXXXXXXX' | sudo tee -a /etc/slogr/env
+  sudo systemctl start slogr-agent
+
+
+---  OPTION 5: JAR DIRECTLY  ---
+
+Requirements:
+  - Java 21
+  - libslogr-native.so in a known directory (Linux only)
+
+Run:
+  export SLOGR_NATIVE_DIR=/path/to/lib
+  export SLOGR_DATA_DIR=/path/to/data
+  export SLOGR_API_KEY=sk_free_XXXXXXXXXX   # optional
+  java -Xmx384m \
+       -Dslogr.native.dir=$SLOGR_NATIVE_DIR \
+       -Dslogr.data.dir=$SLOGR_DATA_DIR \
+       -jar slogr-agent-all.jar daemon
+
+
+================================================================================
+  CLOUD DEPLOYMENT — GOOGLE CLOUD (GCP)
+================================================================================
+
+This section covers everything you need to stand up the agent on a fresh GCP
+Compute Engine VM: API prerequisites, VM sizing, firewall rules, and how to
+operate the VM when SSH is locked down. Use it alongside "OPTION 1: DOCKER"
+above — these steps get you to the point where that section applies.
+
+Tested 2026-04-24 on Debian 12 e2-micro in us-central1-a.
+
+--- 1. One-time project prerequisites ---
+
+Enable Compute Engine API (idempotent; skip if already enabled):
+
+  gcloud services enable compute.googleapis.com --project=$GCP_PROJECT
+
+Confirm enabled:
+
+  gcloud services list --enabled --filter='name:compute.googleapis.com' \
+    --project=$GCP_PROJECT
+
+
+--- 2. VM sizing ---
+
+The agent fits on the smallest general-purpose machines in every cloud:
+
+  Recommended:  e2-micro  (2 vCPU burstable, 1 GB RAM, ~$6/mo on-demand)
+  Acceptable:   e2-small, e2-medium — if you also run other workloads.
+  Too small:    f1-micro (deprecated) — 0.6 GB RAM is below the JVM's 384 MB
+                heap + overhead.
+
+Recommended image: debian-12 (Debian Bookworm) for the longest-supported
+Docker via apt. Ubuntu 22.04 LTS also works. Avoid Container-Optimized OS
+(COS) for first-time setup — see "COS note" below.
+
+Create:
+
+  gcloud compute instances create slogr-agent-gcp \
+    --project=$GCP_PROJECT \
+    --zone=$GCP_ZONE \
+    --machine-type=e2-micro \
+    --image-family=debian-12 --image-project=debian-cloud \
+    --network=default \
+    --tags=slogr-agent
+
+
+--- 3. Firewall rule for TWAMP ---
+
+The GCP `default` VPC does NOT pre-create a firewall rule for TWAMP ports.
+You must add one.
+
+  gcloud compute firewall-rules create slogr-agent-twamp \
+    --project=$GCP_PROJECT \
+    --network=default \
+    --direction=INGRESS \
+    --action=ALLOW \
+    --rules=tcp:862,udp:862-863 \
+    --source-ranges=<SOURCE_IP_OR_CIDR> \
+    --target-tags=slogr-agent
+
+  Where:
+    --source-ranges   CIDR or comma-separated CIDRs of the peer agents that
+                      will initiate TWAMP. For a single peer in another cloud,
+                      use `<peer-public-ip>/32`. For an internal mesh on the
+                      same VPC, use `10.0.0.0/8`.
+    --target-tags     Matches the `--tags=slogr-agent` set at VM creation.
+                      Scopes the rule to slogr agents only (not every VM).
+
+  Ports explained:
+    862/tcp     TWAMP control channel (RFC 5357)
+    862/udp     TWAMP test packets, primary path
+    863/udp     TWAMP test-session UDP (agent sets SLOGR_TEST_PORT=863 in
+                the Docker image; negotiated at session setup but 863 is
+                the default reflector listener).
+
+If you have custom VPC policies that block egress to ghcr.io, you must also
+allow outbound HTTPS (tcp:443) to `ghcr.io` and `pkg-containers.githubusercontent.com`
+for the image pull.
+
+
+--- 4. Running the agent (SSH-free vs SSH) ---
+
+Custom GCP projects often remove the default `default-allow-ssh` rule and
+only allow SSH via IAP tunnel (source range 35.235.240.0/20). If external
+SSH is not available, DON'T open :22 to the internet — use one of the
+mechanisms below instead.
+
+(a) Pre-bake the install into the VM via a startup script (zero SSH needed):
+
+  # startup-slogr-agent.sh — per guide "Install Docker on a fresh Linux VM"
+  #!/bin/bash
+  set -eux
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y docker.io
+  systemctl enable --now docker
+  docker pull ghcr.io/slogr-io/agent:1.3.2
+  docker run -d \
+    --name slogr-agent \
+    --restart unless-stopped \
+    --network host \
+    ghcr.io/slogr-io/agent:1.3.2 daemon
+
+  Then at create time:
+    gcloud compute instances create slogr-agent-gcp ... \
+      --metadata-from-file=startup-script=startup-slogr-agent.sh
+
+  Re-run the script later (for config changes):
+    gcloud compute instances add-metadata slogr-agent-gcp \
+      --project=$GCP_PROJECT --zone=$GCP_ZONE \
+      --metadata-from-file=startup-script=startup-slogr-agent.sh
+    gcloud compute instances reset slogr-agent-gcp \
+      --project=$GCP_PROJECT --zone=$GCP_ZONE
+
+(b) Read logs from the serial console (no SSH needed, always works):
+
+  gcloud compute instances get-serial-port-output slogr-agent-gcp \
+    --project=$GCP_PROJECT --zone=$GCP_ZONE | tail -100
+
+  To surface arbitrary output there on demand, have your script write to
+  /dev/kmsg (kernel ring buffer; shows up in the serial console):
+    docker logs slogr-agent 2>&1 | tee /dev/kmsg
+
+(c) SSH via IAP tunnel (interactive):
+
+  Requires `roles/iap.tunnelResourceAccessor` on the project and an
+  `allow-iap-ssh` firewall rule with source 35.235.240.0/20.
+
+    gcloud compute ssh slogr-agent-gcp \
+      --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap
+
+  Known Windows gotcha: gcloud bundles plink.exe, which does not accept
+  some `-o` ssh options. If plink fails, either force OpenSSH by having
+  `C:\Windows\System32\OpenSSH\ssh.exe` ahead of plink in PATH, or stick
+  to paths (a) and (b) above.
+
+(d) SSH over the public internet (least preferred):
+
+  Open :22 from your workstation's IP only — never 0.0.0.0/0:
+    gcloud compute firewall-rules create slogr-admin-ssh \
+      --project=$GCP_PROJECT --network=default \
+      --direction=INGRESS --action=ALLOW --rules=tcp:22 \
+      --source-ranges=<YOUR_WORKSTATION_IP>/32 --target-tags=slogr-agent
+
+
+--- 5. COS (Container-Optimized OS) note ---
+
+GCP's COS has quirks the guide's setcap-based approach only partially
+compensates for: ambient capabilities aren't propagated to non-root JVMs, and
+the COS iptables chain blocks TCP 862 / UDP 862-863 by default even when the
+VPC firewall allows them. If you must use COS:
+  - Rely on the image's baked-in `setcap` (no --cap-add needed)
+  - Add host-level iptables rules:
+      sudo iptables -I INPUT -p tcp --dport 862   -j ACCEPT
+      sudo iptables -I INPUT -p udp --dport 862:863 -j ACCEPT
+  - Restart the guest agent after VPC firewall changes:
+      sudo systemctl restart google-guest-agent
+  - Tracked in open-issues as AGENT-002.
+
+
+--- 6. Teardown ---
+
+  gcloud compute instances delete slogr-agent-gcp \
+    --project=$GCP_PROJECT --zone=$GCP_ZONE --quiet
+  gcloud compute firewall-rules delete slogr-agent-twamp \
+    --project=$GCP_PROJECT --quiet
+
+
+================================================================================
+  CLOUD DEPLOYMENT — MICROSOFT AZURE
+================================================================================
+
+This section covers everything you need to stand up the agent on a fresh
+Azure VM: resource group, sizing, NSG rules (including priority gotchas),
+and how to operate the VM without opening SSH. Use it alongside "OPTION 1:
+DOCKER" above.
+
+Tested 2026-04-24 on Ubuntu 22.04 Standard_B1s in eastus.
+
+--- 1. One-time subscription prerequisites ---
+
+Ensure the Microsoft.Compute and Microsoft.Network resource providers are
+registered (usually auto-registered on first VM, but new subscriptions
+sometimes need an explicit call):
+
+  az provider register --namespace Microsoft.Compute \
+    --subscription=$AZ_SUBSCRIPTION
+  az provider register --namespace Microsoft.Network \
+    --subscription=$AZ_SUBSCRIPTION
+
+Create a resource group (resources are scoped to one):
+
+  az group create \
+    --subscription=$AZ_SUBSCRIPTION \
+    --name=$AZ_RG \
+    --location=$AZ_REGION
+
+
+--- 2. VM sizing ---
+
+  Recommended:  Standard_B1s   (1 vCPU burstable, 1 GB RAM, ~$7/mo)
+  Acceptable:   Standard_B2s, Standard_D2s_v5 — for multi-tenant hosts.
+  Too small:    Standard_B1ls  (0.5 GB RAM — below JVM heap + overhead)
+
+Recommended image: Ubuntu2204 (Ubuntu 22.04 LTS) — long-supported Docker
+via apt, `az vm run-command` works out of the box.
+
+Create:
+
+  az vm create \
+    --subscription=$AZ_SUBSCRIPTION \
+    --resource-group=$AZ_RG \
+    --name=slogr-agent-azure \
+    --image=Ubuntu2204 \
+    --size=Standard_B1s \
+    --admin-username=azureuser \
+    --generate-ssh-keys \
+    --public-ip-sku=Standard \
+    --tags purpose=slogr-agent
+
+
+--- 3. NSG rules for TWAMP — priority matters ---
+
+When you create a VM with `az vm create`, Azure auto-creates an NSG named
+`<vmname>NSG` with one default rule:
+
+  Name                 Priority  Port  Source
+  default-allow-ssh    1000      22    *
+
+Any NSG rule you add at priority 1000 will collide with a SecurityRuleConflict
+error. USE PRIORITY 1001 OR HIGHER.
+
+  # TCP 862
+  az network nsg rule create \
+    --subscription=$AZ_SUBSCRIPTION \
+    --resource-group=$AZ_RG \
+    --nsg-name=slogr-agent-azureNSG \
+    --name=slogr-agent-twamp-tcp \
+    --priority=1002 \
+    --source-address-prefixes=<PEER_PUBLIC_IP>/32 \
+    --destination-port-ranges=862 \
+    --protocol=Tcp \
+    --access=Allow
+
+  # UDP 862-863
+  az network nsg rule create \
+    --subscription=$AZ_SUBSCRIPTION \
+    --resource-group=$AZ_RG \
+    --nsg-name=slogr-agent-azureNSG \
+    --name=slogr-agent-twamp-udp \
+    --priority=1001 \
+    --source-address-prefixes=<PEER_PUBLIC_IP>/32 \
+    --destination-port-ranges 862 863 \
+    --protocol=Udp \
+    --access=Allow
+
+Note: `az vm open-port --port 862` is a shortcut but it opens to 0.0.0.0/0
+with no source scoping — prefer explicit `az network nsg rule create` for
+anything customer-facing.
+
+
+--- 4. Running the agent (SSH-free vs SSH) ---
+
+Azure has a first-class SSH substitute — `az vm run-command invoke` — which
+executes a shell script on the VM via the Azure agent over the management
+plane. No :22 exposure required. This was the primary mechanism used in the
+2026-04-24 smoke test and is the preferred path for automation.
+
+(a) Pre-bake the install into the VM via cloud-init custom-data:
+
+  # slogr-agent-customdata.sh — per guide "Install Docker on a fresh Linux VM"
+  #!/bin/bash
+  set -eux
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y docker.io
+  systemctl enable --now docker
+  docker pull ghcr.io/slogr-io/agent:1.3.2
+  docker run -d \
+    --name slogr-agent \
+    --restart unless-stopped \
+    --network host \
+    ghcr.io/slogr-io/agent:1.3.2 daemon
+
+  Then at create time:
+    az vm create ... --custom-data @slogr-agent-customdata.sh
+
+  Encoding gotcha on Windows: Azure CLI on Windows reads `--custom-data`
+  files with the latin-1 codec. Non-latin-1 characters (em-dash `—`,
+  curly quotes, etc.) cause:
+    ERROR: 'latin-1' codec can't encode characters in position N-M
+  Keep the script ASCII-only, or run the command from a WSL shell.
+
+(b) Run commands remotely via the Azure agent (SSH-free, works anywhere):
+
+  az vm run-command invoke \
+    --subscription=$AZ_SUBSCRIPTION \
+    --resource-group=$AZ_RG \
+    --name=slogr-agent-azure \
+    --command-id=RunShellScript \
+    --scripts 'docker logs slogr-agent 2>&1 | tail -30' \
+    --query 'value[0].message' -o tsv
+
+  Use the same mechanism to issue a one-shot TWAMP check:
+
+    az vm run-command invoke ... --scripts \
+      'docker exec slogr-agent slogr-agent check <PEER_IP> --format json'
+
+(c) SSH interactively (if port 22 is open):
+
+  az ssh vm \
+    --subscription=$AZ_SUBSCRIPTION \
+    --resource-group=$AZ_RG \
+    --name=slogr-agent-azure
+
+  `az ssh vm` uses the generated key pair from `--generate-ssh-keys` and
+  prefers Azure AD certificate-based auth when available.
+
+
+--- 5. Outbound egress ---
+
+Azure default NSG allows all outbound. No changes required for the ghcr.io
+image pull. Firewall-locked subscriptions that block outbound 443 must allow
+egress to `ghcr.io` and `pkg-containers.githubusercontent.com`.
+
+
+--- 6. Teardown ---
+
+  az group delete \
+    --subscription=$AZ_SUBSCRIPTION \
+    --name=$AZ_RG \
+    --yes --no-wait
+
+Deleting the resource group removes the VM, NIC, NSG, public IP, disk, and
+all associated rules in a single call.
+
+
+================================================================================
+  REQUIRED LINUX CAPABILITIES
+================================================================================
+
+The agent needs two Linux capabilities:
+
+  CAP_NET_RAW          Required for ICMP traceroute and ICMP ping fallback.
+  CAP_NET_BIND_SERVICE Required to bind port 862 (< 1024) as non-root user.
+
+The shipped Docker image grants both via `setcap` directly on the `java`
+binary (see Dockerfile). Systemd installs should either:
+
+  (a) use `setcap` the same way (recommended), OR
+  (b) declare in the service unit:
+        AmbientCapabilities   = CAP_NET_RAW CAP_NET_BIND_SERVICE
+        CapabilityBoundingSet = CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+Without CAP_NET_RAW traceroute and the ICMP fallback in `check` will fail.
+Without CAP_NET_BIND_SERVICE the reflector cannot bind port 862.
+
+
+================================================================================
+  ENVIRONMENT VARIABLES
+================================================================================
+
+Variable                          Default                 Purpose
+--------------------------------  ----------------------  -----------------------
+SLOGR_API_KEY                     (not set)               API key. Prefix
+                                                          determines state:
+                                                          sk_free_* = REGISTERED
+                                                          sk_live_* = CONNECTED
+SLOGR_API_URL                     https://api.slogr.io    Registration endpoint.
+                                                          Enterprise on-prem
+                                                          points this at the
+                                                          customer controller.
+SLOGR_OTLP_ENDPOINT               (not set)               OpenTelemetry HTTP
+                                                          metrics endpoint.
+SLOGR_DATA_DIR                    ~/.slogr                Credentials + schedule
+                                                          + fingerprint storage.
+                                                          Docker image defaults
+                                                          to /opt/slogr/data.
+SLOGR_NATIVE_DIR                  /opt/slogr/lib (docker) Directory for
+                                                          libslogr-native.so.
+SLOGR_TEST_PORT                   0 (ephemeral) /         Fixed UDP test port.
+                                  863 (docker default)    Docker EXPOSEs 863.
+SLOGR_COMMAND_CHANNEL             pubsub                  pubsub | rabbitmq.
+                                                          `rabbitmq` is the
+                                                          Enterprise on-prem
+                                                          path (RFC-1014 Phase 2).
+SLOGR_HEALTH_PORT                 8080                    HealthServer bind port.
+                                                          `0` disables the
+                                                          /healthz endpoint.
+SLOGR_FINGERPRINT_SOURCE          (unset)                 Unset = UUID|mac|hostname.
+                                                          `cloud-metadata` =
+                                                          SHA256(cloud|region|
+                                                          mesh-anchor) — stable
+                                                          across MIG/ASG
+                                                          recreation. Used by
+                                                          mesh anchor fleet.
+SLOGR_JWT_RECOVERY_MAX_ATTEMPTS   3                       Max consecutive 401s
+                                                          before giving up JWT
+                                                          recovery (5xx retries
+                                                          do NOT count).
+GCP_PROJECT                       slogr-app               Pub/Sub project id
+                                                          (SaaS only).
+JAVA_OPTS                         -Xmx384m                JVM options.
+
+System properties (passed as -D flags):
+  slogr.data.dir           Same as SLOGR_DATA_DIR
+  slogr.native.dir         Same as SLOGR_NATIVE_DIR
+
+All SLOGR_* env reads are trimmed via EnvLoader.loadTrimmedEnv — CRLF / trailing
+whitespace from SCCM/Intune/Jamf pushes will not break startup.
+
+
+================================================================================
+  HEALTH ENDPOINT (v1.3.1+)
+================================================================================
+
+When CONNECTED, the daemon starts an HTTP health server on
+0.0.0.0:$SLOGR_HEALTH_PORT (default 8080) with a single route:
+
+  GET /healthz
+    200 OK                    when all three signals are fresh:
+                                - agent state is CONNECTED
+                                - last measurement seen within 120 seconds
+                                - command-channel transport is open
+    503 Service Unavailable   otherwise; body names the failed check
+    405                        method not allowed
+    404                        any other path
+
+No authentication. Meant for GCP MIG / load-balancer healthchecks
+(source ranges 35.191.0.0/16, 130.211.0.0/22). SaaS-only or desktop agents
+that do not want the port exposed can set SLOGR_HEALTH_PORT=0 to disable.
+
+
+================================================================================
+  CLI COMMANDS
+================================================================================
+
+--------  slogr-agent version  --------
+
+Print version, git commit, and build time.
+
+  Usage:  slogr-agent version
+
+  Output: slogr-agent 1.3.2 (f7487d9) built 2026-04-23T...
+
+
+--------  slogr-agent status  --------
+
+Show current agent state and configuration.
+
+  Usage:  slogr-agent status
+
+  Output fields:
+    Status:    Connected / Disconnected
+    Mode:      ANONYMOUS (stdout only) |
+               REGISTERED (OTLP + stdout) |
+               CONNECTED (RabbitMQ + OTLP + stdout)
+    Key:       Masked API key (first 8 + last 4 chars)
+    Agent ID:  UUID (if registered)
+    Display:   Display name from registration
+    Tenant ID: UUID (if connected)
+    RabbitMQ:  host:port (if connected)
+    Pub/Sub:   GCP subscription path (if connected)
+
+
+--------  slogr-agent check <target>  --------
+
+Run a one-shot measurement against a target and print results.
+
+  Usage:  slogr-agent check <host-or-ip> [options]
+
+  Options:
+    --port, -p <port>             TWAMP target port (default: 862)
+    --profile <name>              SLA profile to evaluate (default: internet)
+    --format, -f <text|json>      Output format (default: text)
+    --traceroute                  Include traceroute in measurement
+    --traceroute-timeout <sec>    Max seconds for traceroute fallback chain
+                                  (default: 60). First mode always completes;
+                                  actual time may exceed by up to 30s.
+    --traceroute-mode <mode>      Force traceroute mode: icmp, tcp, or udp
+                                  (default: auto fallback chain)
+
+  Measurement flow:
+    1. Attempts TWAMP (RFC 5357) to target:port
+    2. If TWAMP returns 0 packets received: falls back to ICMP ping (5 probes)
+    3. Attempts TCP connect on the given port (then 443 / 80)
+    4. Optionally traces the path (ICMP → TCP → UDP fallback chain)
+    5. Exports results to OTLP if SLOGR_OTLP_ENDPOINT is set and state is
+       REGISTERED or CONNECTED
+
+  Exit codes:
+    0   Measurement succeeded
+    2   Invalid option (e.g. bad --traceroute-mode)
+    3   Target unreachable (TWAMP + ICMP + TCP all failed, or DNS resolve)
+    1   Other error
+
+  JSON output fields (TWAMP path):
+    measurement_method    "twamp" or "icmp"
+    target                IP address
+    profile               Profile name used
+    grade                 GREEN, YELLOW, or RED
+    twamp {}
+      rtt_min_ms          Float — ground-truth RTT: (T4-T1)-(T3-T2)
+      rtt_avg_ms          Float — ground-truth RTT (used for SLA grading)
+      rtt_max_ms          Float — ground-truth RTT
+      packets_sent        Integer
+      packets_recv        Integer
+      fwd_loss_pct        Float (%)
+      fwd_min_rtt_ms      Float — forward delay (ratio-scaled from RTT)
+      fwd_avg_rtt_ms      Float
+      fwd_max_rtt_ms      Float
+      fwd_jitter_ms       Float
+      rev_min_rtt_ms      Float (0 if clocks unsyncable)
+      rev_avg_rtt_ms      Float (0 if clocks unsyncable)
+      rev_max_rtt_ms      Float (0 if clocks unsyncable)
+      rev_jitter_ms       Float (optional)
+      session_id          UUID
+      path_id             UUID
+      dscp_requested      Integer — DSCP the profile asked for (e.g. 46 for voip)
+      dscp_received       Integer — DSCP the reflector actually saw on the wire
+      dscp_status         String:
+                            "applied"    — dscp_received == dscp_requested; the
+                                           whole path honoured the marking.
+                            "rewritten"  — reflector saw a different DSCP
+                                           (typically 0). Some hop on the path
+                                           stripped or rewrote the marking.
+                                           Common on public internet, Azure, and
+                                           some carrier networks — NOT a failure.
+                                           The measurement is still valid; the
+                                           agent falls back to best-effort on
+                                           subsequent sessions (RFC-010).
+                            "filtered"   — 0 of 5 priming probes returned;
+                                           the DSCP path is fully blocked.
+                                           Treat like "rewritten" operationally.
+    ping {}               (present if TWAMP unavailable)
+      sent, received, loss_pct, min_rtt_ms, avg_rtt_ms, max_rtt_ms
+    tcp {}                (present if TCP fallback attempted)
+      port, connect_ms
+    traceroute {}         (present if --traceroute used)
+      direction           "uplink"
+      hops []
+        ttl, ip, rtt_ms, loss_pct, asn, asn_name
+
+  Examples:
+    slogr-agent check 8.8.8.8
+    slogr-agent check 10.0.0.5 --port 862 --profile voip
+    slogr-agent check 10.0.0.5 --format json
+    slogr-agent check 10.0.0.5 --traceroute --traceroute-mode tcp
+
+
+--------  slogr-agent connect  --------
+
+Interactively register this agent with the Slogr backend using a live API key.
+Only needed for CONNECTED mode. For mass deployment, skip this command and let
+`daemon` auto-register on first boot — just set SLOGR_API_KEY.
+
+  Usage:  slogr-agent connect [--api-key <key>]
+
+  Options:
+    --api-key <key>   Live API key (sk_live_*). Falls back to the SLOGR_API_KEY
+                      env var. Prompts interactively if neither is set.
+
+  What it does:
+    1. Checks not already connected (aborts if already registered)
+    2. Validates key format (must start with sk_live_)
+    3. POSTs to SLOGR_API_URL/v1/agents with machine metadata:
+         hostname, MAC address, IP addresses, cloud provider/region,
+         OS info, Java version, CPU cores, memory
+    4. Receives: JWT, RabbitMQ credentials, Pub/Sub subscription path
+    5. Encrypts and stores credentials to {SLOGR_DATA_DIR}/credential.enc
+
+  Exit codes:
+    0   Registered successfully
+    1   Network error / API returned 4xx/5xx / user abort
+    4   Invalid key format
+
+  After connect, run:  slogr-agent daemon
+
+
+--------  slogr-agent disconnect  --------
+
+Remove stored credentials. Agent returns to ANONYMOUS or REGISTERED mode on
+the next `daemon` start.
+
+  Usage:  slogr-agent disconnect
+
+  What it does:
+    - Deletes {SLOGR_DATA_DIR}/credential.enc
+    - Does NOT call a deregister API (the agent record stays in Cloud SQL
+      as "inactive" — ops can mark it terminated via the admin console)
+    - A running daemon continues in its current mode until restarted
+    - Agent can be re-registered with `slogr-agent connect` later
+
+  Exit code: 0 (always)
+
+
+--------  slogr-agent daemon  --------
+
+Run the agent as a foreground/background daemon. This is the primary
+production command.
+
+  Usage:  slogr-agent daemon [--config <path>] [--no-reflector]
+
+  Options:
+    --config <path>     Path to a schedule config JSON. If omitted, loads the
+                        persisted schedule from {SLOGR_DATA_DIR}/schedule.json;
+                        otherwise runs in responder-only mode until a
+                        `set_schedule` command arrives.
+    --no-reflector      Sender-only. Skips the TWAMP reflector bind on port 862.
+                        Use for desktop/laptop agents behind NAT that cannot
+                        accept inbound TWAMP sessions. Detected pre-parse so
+                        the BindException path is avoided entirely.
+
+  Startup behaviour (state-aware):
+    CONNECTED + no stored credential  →  Auto-registers with SLOGR_API_URL
+    CONNECTED + stored credential     →  Connects using stored JWT
+    REGISTERED                        →  OTLP export enabled, no queue
+    ANONYMOUS                         →  stdout only, nudges for API key
+
+  What runs in daemon mode:
+    1. TWAMP reflector binds 0.0.0.0:862 (unless --no-reflector)
+    2. Loads schedule (--config file, or persisted, or empty)
+    3. Responder-only if no sessions — still accepts incoming TWAMP
+    4. Runs up to 20 concurrent measurement sessions on schedule cadence
+    5. Records each result to OTLP exporter
+    6. In CONNECTED mode, also:
+         - RabbitMqConnection with JWT-refresh reconnect loop
+         - TokenRefresher (10-min JWT refresh + 401-triggered re-register,
+           bounded by SLOGR_JWT_RECOVERY_MAX_ATTEMPTS)
+         - HealthReporter publishes a HealthSnapshot every 60 s
+         - Command subscriber — Pub/Sub OR RabbitMQ per SLOGR_COMMAND_CHANNEL
+         - HealthServer serves /healthz on SLOGR_HEALTH_PORT
+    7. On SIGTERM: stops scheduler, flushes metrics, closes connections, exits
+
+  Signals:
+    SIGTERM   Graceful shutdown (systemd stop / docker stop)
+    SIGINT    Same as SIGTERM
+
+
+--------  slogr-agent setup-asn  --------
+
+Optionally configure a MaxMind GeoLite2-ASN database for higher-accuracy ASN
+enrichment on traceroute hops.
+
+  Usage:  slogr-agent setup-asn [--db-path <path>]
+
+  Options:
+    --db-path <path>   Path to GeoLite2-ASN.mmdb
+                       Default: {SLOGR_DATA_DIR}/GeoLite2-ASN.mmdb
+
+  Note: Since v1.0.6 ASN enrichment works automatically using a bundled ip2asn
+  database (442K entries). MaxMind is optional and adds accuracy only — the
+  agent runs fine without it. To use MaxMind:
+    1. Register at https://www.maxmind.com/en/geolite2/signup
+    2. Download GeoLite2-ASN.mmdb
+    3. Place at the path above, then run `slogr-agent setup-asn` to verify.
+
+
+--------  slogr-agent doctor  --------
+
+Run diagnostics to verify the agent environment is correctly configured.
+
+  Usage:  slogr-agent doctor
+
+  Checks performed:
+    1. JNI native library (libslogr-native.so) — can it be loaded?
+    2. CAP_NET_RAW — is bit 13 set in /proc/self/status CapEff? (Linux only)
+    3. TLS handshake to slogr.io:443 — skipped when AirGapDetector fires
+
+  Each failing check prints a targeted remediation hint.
+
+  Exit codes:
+    0   All checks passed (or skipped for air-gap)
+    1   One or more checks failed
+
+
+================================================================================
+  SLA PROFILES
+================================================================================
+
+Use --profile <name> with the `check` command. Default is "internet".
+
+Profile          Packets  Interval  DSCP  RTT Grn  RTT Red  Loss Grn  Loss Red
+---------------  -------  --------  ----  -------  -------  --------  --------
+internet         10       50ms      8     150ms    300ms    1%        5%
+voip             50       20ms      46    150ms    300ms    0.5%      1%
+gaming           20       50ms      34    20ms     50ms     0.5%      1%
+multigame        33       30ms      34    30ms     60ms     0.5%      1%
+cloud-gaming     50       20ms      40    30ms     70ms     0.5%      1%
+videoconf        50       20ms      34    150ms    300ms    0.5%      1%
+webconf          20       50ms      34    150ms    300ms    0.5%      1%
+streaming        30       50ms      36    100ms    200ms    0.1%      0.5%
+pcoip            33       30ms      40    100ms    150ms    0.5%      1%
+remote-desktop   33       30ms      26    100ms    150ms    0.5%      1%
+cloud-saas       10       50ms      32    100ms    300ms    0.1%      0.5%
+vpn              20       50ms      24    100ms    200ms    0.5%      1%
+download         10       50ms      10    100ms    200ms    0.1%      0.5%
+upload           10       50ms      12    100ms    200ms    0.1%      0.5%
+largefile        20       50ms      12    150ms    500ms    0.1%      0.5%
+mail             20       50ms      10    100ms    300ms    0.1%      0.5%
+online-payment   20       50ms      26    100ms    300ms    0.1%      0.5%
+online-learning  10       100ms     26    150ms    350ms    0.1%      0.5%
+broadcasting     50       20ms      36    150ms    300ms    0.5%      1%
+music            20       50ms      36    50ms     300ms    0.1%      1%
+iot              30       50ms      0     200ms    300ms    0.1%      0.5%
+ssm              20       50ms      26    150ms    500ms    0.1%      0.5%
+player           20       50ms      36    100ms    200ms    0.1%      0.5%
+data-recovery    20       50ms      12    150ms    300ms    0.1%      0.5%
+
+24 profiles total. Thresholds come from engine/src/main/resources/profiles.json.
+Jitter thresholds are also per-profile; omitted here for column width — see the
+JSON file for the full spec. Connected agents can receive updated profile
+definitions from the backend via `push_config`.
+
+Grade logic (evaluated against ground-truth RTT = (T4-T1)-(T3-T2), not one-way):
+  GREEN   rtt_avg_ms <= rttGreenMs  AND  jitter <= jitterGreenMs  AND  loss <= lossGreenPct
+  YELLOW  rtt_avg_ms <= rttRedMs    AND  jitter <= jitterRedMs    AND  loss <= lossRedPct  (and not GREEN)
+  RED     rtt_avg_ms >  rttRedMs    OR   jitter >  jitterRedMs    OR   loss >  lossRedPct
+  Jitter = max(fwd_jitter, rev_jitter)
+
+Built-in profiles recognised by backend-pushed `set_schedule` commands: only
+`internet`, `voip`, and `mesh`. Other profile names must be supplied inline in
+the schedule's profile block.
+
+
+================================================================================
+  OTLP METRICS REFERENCE
+================================================================================
+
+Metric names are locked — changing them breaks Slogr Proxy ingestion.
+
+Metric name                           Type   Unit   Description
+------------------------------------  -----  -----  ----------------------------
+slogr.network.rtt.min                 gauge  ms     Ground-truth RTT min
+slogr.network.rtt.avg                 gauge  ms     Ground-truth RTT avg (SLA key)
+slogr.network.rtt.max                 gauge  ms     Ground-truth RTT max
+slogr.network.rtt.forward.min         gauge  ms     Forward delay (ratio from RTT)
+slogr.network.rtt.forward.avg         gauge  ms     Forward delay average
+slogr.network.rtt.forward.max         gauge  ms     Forward delay maximum
+slogr.network.rtt.reverse.min         gauge  ms     Reverse delay (0 if unsyncable)
+slogr.network.rtt.reverse.avg         gauge  ms     Reverse delay average
+slogr.network.rtt.reverse.max         gauge  ms     Reverse delay maximum
+slogr.network.jitter.forward          gauge  ms     Forward jitter
+slogr.network.jitter.reverse          gauge  ms     Reverse jitter
+slogr.network.loss.forward            gauge  %      Forward packet loss
+slogr.network.loss.reverse            gauge  %      Reverse packet loss
+slogr.network.packets.sent            gauge  count  Packets sent
+slogr.network.packets.received        gauge  count  Packets received
+slogr.network.traceroute.hop_count    gauge  count  Number of traceroute hops
+slogr.network.traceroute.path_changed gauge  flag   1.0 = path changed, 0.0 = same
+slogr.network.sla.grade               gauge  enum   0=GREEN, 1=YELLOW, 2=RED
+slogr.agent.buffer.size               gauge  rows   WAL buffer size
+slogr.agent.failures.twamp            gauge  count  TWAMP failure count
+slogr.agent.failures.traceroute       gauge  count  Traceroute failure count
+slogr.agent.failures.publish          gauge  count  Publish failure count
+
+Common attributes on every metric:
+  agent_id            UUID of this agent
+  profile             SLA profile name (e.g. "voip", "gaming")
+  measurement_method  "twamp" or "icmp"
+
+OTLP is enabled only when:
+  - SLOGR_OTLP_ENDPOINT is set, AND
+  - Agent state is REGISTERED or CONNECTED (not ANONYMOUS)
+
+Transport: OTLP/HTTP only (no gRPC).
+
+
+================================================================================
+  CREDENTIAL & FINGERPRINT STORAGE
+================================================================================
+
+Credentials:             {SLOGR_DATA_DIR}/credential.enc
+  - AES-256-GCM encryption
+  - Key derived from a stable machine fingerprint (see below)
+  - File format: [12-byte IV][AES-GCM ciphertext]
+  - File permissions: 0600 (owner read/write only)
+  - Contents: agentId, tenantId, displayName, JWT, RabbitMQ creds,
+    Pub/Sub subscription, connection timestamp
+
+Fingerprint:             persisted to the first writable location of:
+  1. {SLOGR_DATA_DIR}/.agent_fingerprint
+  2. /var/lib/slogr/.agent_fingerprint
+  3. ${HOME}/.slogr/.agent_fingerprint
+
+Fingerprint source (SLOGR_FINGERPRINT_SOURCE):
+  unset / empty   UUID|mac|hostname (default — SaaS, desktop, single host)
+  cloud-metadata  SHA256("<cloud>|<region>|mesh-anchor") — stable across
+                  MIG / ASG recreation; used by the anchor-agent mesh fleet so
+                  auto-heal events don't create duplicate anchor_agents rows
+  any other value logs a WARN and falls back to the default (fail-safe)
+
+If a stored fingerprint's format doesn't match the current
+SLOGR_FINGERPRINT_SOURCE, v1.3.2 regenerates it and logs a WARN rather than
+silently using the stale value (#63).
+
+Validation cache for sk_free_* keys:
+  {SLOGR_DATA_DIR}/.slogr-key-cache.json — TTL 24 hours. Expired entries trigger
+  re-validation against the backend.
+
+
+================================================================================
+  SCHEDULE FILE FORMAT
+================================================================================
+
+The schedule file ({SLOGR_DATA_DIR}/schedule.json) defines outbound sessions.
+In CONNECTED mode the backend pushes this via `set_schedule`. In standalone
+mode you can write it manually or pass `--config` to `daemon`.
+
+{
+  "sessions": [
+    {
+      "path_id":            "550e8400-e29b-41d4-a716-446655440000",
+      "target_ip":          "10.0.0.5",
+      "target_port":        862,
+      "profile": {
+        "name":             "voip",
+        "n_packets":        50,
+        "interval_ms":      20,
+        "wait_time_ms":     2000,
+        "dscp":             46,
+        "packet_size":      200,
+        "timing_mode":      "FIXED",
+        "rtt_green_ms":     150.0,
+        "rtt_red_ms":       300.0,
+        "jitter_green_ms":  15.0,
+        "jitter_red_ms":    30.0,
+        "loss_green_pct":   0.5,
+        "loss_red_pct":     1.0
+      },
+      "interval_seconds":   300,
+      "traceroute_enabled": true,
+      "skip_cycles":        0,
+      "tcp_probe_ports":    [443]
+    }
+  ],
+  "received_at": "2026-04-23T10:30:00Z",
+  "command_id":  "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+}
+
+Fields:
+  path_id             UUID identifying this measurement path
+  target_ip           Destination agent IP
+  target_port         TWAMP control port (almost always 862)
+  profile             Full SlaProfile object (see profiles section)
+  interval_seconds    How often to run this session
+  traceroute_enabled  Run traceroute after TWAMP?
+  skip_cycles         Skip first N cycles after schedule load
+  tcp_probe_ports     Ports to probe if TWAMP + ICMP both fail
+
+Up to 20 sessions run concurrently (maxConcurrentSessions in AgentConfig).
+
+
+================================================================================
+  CROSS-CLOUD SMOKE TEST — GCP + AZURE
+================================================================================
+
+Verified working 2026-04-24 between e2-micro (GCP us-central1-a, Debian 12)
+and Standard_B1s (Azure eastus, Ubuntu 22.04). Ground-truth RTT ~30 ms both
+directions, 10/10 packets, grade GREEN.
+
+Prerequisite sections — follow these first, in order:
+  1. "CLOUD DEPLOYMENT — GOOGLE CLOUD (GCP)" for the GCP side
+  2. "CLOUD DEPLOYMENT — MICROSOFT AZURE" for the Azure side
+  3. "OPTION 1: DOCKER" for the per-host agent install
+
+Firewall scoping for the smoke test:
+  - GCP firewall rule: `--source-ranges=<AZURE_PUBLIC_IP>/32`
+  - Azure NSG rules:   `--source-address-prefixes=<GCP_PUBLIC_IP>/32`,
+                       priorities 1001 (UDP) and 1002 (TCP)
+
+Issue the bidirectional TWAMP check:
+
+  # From Azure -> GCP (uses az vm run-command, no SSH needed):
+  az vm run-command invoke \
+    --subscription=$AZ_SUBSCRIPTION --resource-group=$AZ_RG \
+    --name=slogr-agent-azure --command-id=RunShellScript \
+    --scripts 'docker exec slogr-agent slogr-agent check <GCP_PUBLIC_IP> --format json'
+
+  # From GCP -> Azure (if GCP SSH is blocked, use startup-script + serial-console
+  # pattern from the GCP section, step 4(a)/4(b)):
+  docker exec slogr-agent slogr-agent check <AZURE_PUBLIC_IP> --format json
+
+Expected output (both directions):
+  "measurement_method": "twamp"
+  "grade":              "GREEN"
+  "packets_recv":       equal to "packets_sent"
+  "rtt_avg_ms":         non-zero (typical: 20-50 ms cross-region public internet)
+
+If you see `"dscp_status": "rewritten"` in one direction (typical on Azure-side
+reflection), that is NOT a failure — see the `dscp_status` field in the
+"slogr-agent check" CLI reference for interpretation.
+
+Teardown:
+
+  gcloud compute instances delete slogr-agent-gcp \
+    --project=$GCP_PROJECT --zone=$GCP_ZONE --quiet
+  gcloud compute firewall-rules delete slogr-agent-twamp \
+    --project=$GCP_PROJECT --quiet
+  az group delete --subscription=$AZ_SUBSCRIPTION --name=$AZ_RG --yes --no-wait
+
+
+================================================================================
+  TESTING THE AGENT
+================================================================================
+
+---  Test 1: Agent reflects against itself  ---
+
+On machine A, start the daemon:
+  slogr-agent daemon
+
+On machine B, run a check against A:
+  slogr-agent check <machine-A-IP>
+
+Expected output (text):
+  Target: <IP>
+  Method: TWAMP (RFC 5357)
+  Grade:  GREEN
+  RTT:    min=X.Xms  avg=X.Xms  max=X.Xms
+  Loss:   0.0%
+  Jitter: X.Xms
+
+
+---  Test 2: Verify JSON output fields  ---
+
+  slogr-agent check 8.8.8.8 --format json | python3 -c "
+  import json, sys
+  data = json.load(sys.stdin)
+  for k in ('grade', 'target', 'profile'):
+      assert k in str(data), 'missing ' + k
+  print('OK:', data.get('grade'))
+  "
+
+
+---  Test 3: Verify version  ---
+
+  slogr-agent version
+  # Expected: slogr-agent 1.3.2 (f7487d9) built ...
+
+
+---  Test 4: Verify status  ---
+
+  slogr-agent status
+  # Shows current mode, key status, agent ID if registered
+
+
+---  Test 5: Run diagnostics  ---
+
+  slogr-agent doctor
+  # Checks JNI library, CAP_NET_RAW, TLS to slogr.io
+
+
+---  Test 6: Two-container Docker E2E  ---
+
+  # Start reflector
+  docker network create test-net
+  docker run -d --name agent-b --network test-net \
+    --sysctl net.ipv4.ip_unprivileged_port_start=862 \
+    ghcr.io/slogr-io/agent:1.3.2 daemon
+
+  # Wait for reflector to bind
+  until docker logs agent-b 2>&1 | grep -q "TWAMP reflector listening"; do
+    sleep 1
+  done
+
+  # Run check from agent A
+  B_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' agent-b)
+  docker run --rm --network test-net \
+    --sysctl net.ipv4.ip_unprivileged_port_start=862 \
+    ghcr.io/slogr-io/agent:1.3.2 check "$B_IP"
+
+  # Cleanup
+  docker stop agent-b && docker rm agent-b
+  docker network rm test-net
+
+
+---  Test 7: Profile-specific check  ---
+
+  slogr-agent check <IP> --profile voip
+  slogr-agent check <IP> --profile gaming
+  slogr-agent check <IP> --profile streaming
+
+
+---  Test 8: ICMP fallback (non-TWAMP target)  ---
+
+  # Run against a host with no TWAMP responder — should fall back to ICMP/TCP
+  slogr-agent check 8.8.8.8 --profile internet --format json
+  # Expected: "measurement_method": "icmp" in JSON output
+
+
+---  Test 9: Health endpoint  ---
+
+  # With daemon running in CONNECTED mode:
+  curl -sS http://localhost:8080/healthz
+  # 200 "healthy"              — fresh measurement + open transport
+  # 503 "unhealthy: ..."       — see body for the failing check
+
+
+================================================================================
+  DATA FLOW OVERVIEW
+================================================================================
+
+Inbound (reflector mode):
+  Remote agent connects to 0.0.0.0:862 (TCP)
+    → TwampReflector accepts and runs the RFC 5357 state machine
+    → Negotiates session, opens UDP test port (SLOGR_TEST_PORT or ephemeral)
+    → Reflects test packets back with T1..T4 timestamps
+
+Outbound (controller mode):
+  TestScheduler fires on interval
+    → TwampController connects to target:862 (TCP)
+    → Exchanges TWAMP control messages
+    → Sends/receives UDP test packets
+    → MeasurementAssembler builds MeasurementResult
+    → SlaEvaluator assigns grade
+    → OtlpExporter records metrics
+    → In CONNECTED mode: RabbitMqPublisher publishes to slogr.measurements
+      with routing_key=agent.<uuid>.twamp
+    → onResult callback logs grade
+
+Command channel (CONNECTED mode only):
+  PubSub (SaaS default):
+    GCP Pub/Sub subscription → PubSubSubscriber polls → CommandDispatcher →
+    SetScheduleHandler (etc.) → TestScheduler updated
+  RabbitMQ (Enterprise on-prem, SLOGR_COMMAND_CHANNEL=rabbitmq):
+    AMQP consumer on per-agent queue → EnterpriseEnvelopeAdapter strips
+    envelope → same CommandDispatcher path as PubSub
+
+
+================================================================================
+  FILE LOCATIONS REFERENCE
+================================================================================
+
+Runtime files (in SLOGR_DATA_DIR — default ~/.slogr or /opt/slogr/data):
+  credential.enc            Encrypted agent credential
+  .agent_fingerprint        Stable machine fingerprint (also tried in /var/lib/slogr/)
+  .slogr-key-cache.json     sk_free_* validation cache (24h TTL)
+  schedule.json             Active measurement schedule
+  GeoLite2-ASN.mmdb         Optional MaxMind ASN DB
+
+System files (systemd / RPM / DEB installs):
+  /usr/local/bin/slogr-agent         Launcher script (wrapper.sh)
+  /opt/slogr/slogr-agent-all.jar     Application JAR
+  /opt/slogr/lib/libslogr-native.so  JNI native library
+  /etc/systemd/system/slogr-agent.service  Systemd service
+  /etc/slogr/env                     Environment file (600, systemd EnvironmentFile)
+
+
+================================================================================
+  KNOWN REQUIREMENTS AND CONSTRAINTS
+================================================================================
+
+- Java 21 required (Temurin 21 or Amazon Corretto 21)
+- Linux required for production — JNI + raw sockets
+- JVM heap: 384 MB default, total process ceiling ~512 MB (fits on t3.micro /
+  t4g.micro / e2-micro / B1s)
+- Port 862/TCP + 862/UDP must be reachable between agents for TWAMP
+- SLOGR_TEST_PORT (default 863/UDP in Docker) must also be reachable
+- CAP_NET_RAW required for ICMP traceroute + ICMP ping fallback
+- CAP_NET_BIND_SERVICE required to bind 862 as non-root
+- OTLP endpoint must be HTTP (not gRPC)
+- On GCP COS: --sysctl net.ipv4.ip_unprivileged_port_start=862 preferred over
+  --cap-add (the Dockerfile already sets capabilities via setcap on java)
+- Host-level iptables rules may be required in addition to GCP firewall on COS
+
+Windows note: the agent builds and runs a subset of commands on Windows for
+development, but the JNI features (TWAMP raw UDP, ICMP traceroute) require
+Linux. Production deployments are Linux-only. For end-user Windows/macOS, use
+the Slogr Desktop build (see slogr-agents/desktop/).
+
+
+================================================================================
+  QUICK REFERENCE — MOST COMMON OPERATIONS
+================================================================================
+
+  # One-shot check
+  slogr-agent check 10.0.0.5
+
+  # One-shot check with profile and JSON output
+  slogr-agent check 10.0.0.5 --profile voip --format json
+
+  # Register with backend (sk_live_ key) — only needed if not using mass deploy
+  slogr-agent connect --api-key sk_live_XXXXXXXXXX
+
+  # Check status after registration
+  slogr-agent status
+
+  # Start daemon — REGISTERED
+  export SLOGR_API_KEY=sk_free_XXXXXXXXXX
+  export SLOGR_OTLP_ENDPOINT=https://otel.slogr.io/v1/metrics
+  slogr-agent daemon
+
+  # Start daemon — CONNECTED, SaaS (auto-registers on first boot)
+  export SLOGR_API_KEY=sk_live_XXXXXXXXXX
+  slogr-agent daemon
+
+  # Start daemon — CONNECTED, Enterprise on-prem
+  export SLOGR_API_KEY=sk_live_XXXXXXXXXX
+  export SLOGR_API_URL=https://slogr.acme.corp
+  export SLOGR_COMMAND_CHANNEL=rabbitmq
+  slogr-agent daemon
+
+  # Sender-only (laptop / NAT'd agent)
+  slogr-agent daemon --no-reflector
+
+  # Start daemon with custom schedule file
+  slogr-agent daemon --config /path/to/schedule.json
+
+  # Run diagnostics
+  slogr-agent doctor
+
+  # Check health (CONNECTED mode)
+  curl -sS http://localhost:8080/healthz
+
+  # View version
+  slogr-agent version
+
+  # Remove credentials
+  slogr-agent disconnect
+
+
+================================================================================
+  WHAT'S NEW SINCE v1.0.0 (R2 baseline)
+================================================================================
+
+v1.0.5  Ground-truth RTT: rtt_min/avg/max_ms = (T4-T1)-(T3-T2). Directional
+        splits are now ratio-scaled from the RTT. SLA grades use full RTT.
+v1.0.6  Zero-config ASN/ISP via bundled ip2asn database (442K entries).
+        MaxMind is now optional (higher accuracy only).
+v1.0.7  `check` JSON includes rtt_* fields, --traceroute-mode / --traceroute-timeout,
+        BindException messages are actionable.
+v1.0.8  JNI adapter auto-detection fixes traceroute/ICMP hang. Dockerfile
+        compiles libslogr-native.so from source.
+v1.0.9  Reverted setTos on Java UDP transport (ISPs drop DSCP-marked UDP).
+        Packet size capped at 1350 bytes for MTU safety.
+v1.1.0  RFC-010: DSCP filtering detection + automatic best-effort fallback.
+        Detects both filtering (0/5 probe) and rewriting (rxTos mismatch).
+v1.2.0  TCP traceroute target port fix (Azure). `setcap` Docker fix for COS.
+v1.2.1  Daemon wires PubSubSubscriber + TokenRefresher + HealthReporter.
+        Mesh bring-up blocker fixed.
+v1.2.2  RabbitMqPublisher now sets tenant_id/schema_version/source_type on
+        published measurements.
+v1.2.3  Fingerprint persists to SLOGR_DATA_DIR so Docker volume mounts don't
+        trigger "Tag mismatch" on restart.
+v1.2.4  Dockerfile base Alpine → Temurin 21 jammy (glibc). Fixes Netty tcnative
+        SIGSEGV on COS. UID 10001. CI release chain auto-publishes.
+v1.3.0  RFC-1014 Phase 2: RabbitMQ command-channel subscriber +
+        EnterpriseEnvelopeAdapter. Opt-in via SLOGR_COMMAND_CHANNEL=rabbitmq;
+        PubSub remains default for SaaS.
+v1.3.1  RFC-1015 mesh-ready runtime. /healthz on SLOGR_HEALTH_PORT (default
+        8080), 120s measurement-freshness gate. cloud-metadata fingerprint
+        mode for MIG/ASG stability. Bounded JWT recovery on 401
+        (SLOGR_JWT_RECOVERY_MAX_ATTEMPTS, default 3).
+v1.3.2  Hygiene bundle from the 2026-04-22 Linux E2E + Azure mesh bring-up.
+        Fingerprint file-format validation (regenerate on stale). EnvLoader
+        trims every SLOGR_API_KEY / SLOGR_API_URL read. Boot-time fingerprint
+        INFO line is unconditional. RabbitMqCommandSubscriber emits a
+        throwable-form WARN and the "started" INFO is gated on actual
+        readiness — no more silent command-channel failures.
+
+
+================================================================================
+  END OF DOCUMENT — Slogr Agent v1.3.2
+================================================================================
